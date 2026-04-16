@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Equinox - God Mode</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-10">
+    <div class="flex justify-between items-center mb-10">
+        <div>
+            <h1 class="text-4xl font-bold text-gray-800">🚕 God Mode</h1>
+            <p class="text-gray-500">Secure System Overview & Financials</p>
+        </div>
+        <div class="bg-white p-4 rounded-lg shadow-md">
+            <p class="text-sm text-gray-500">Platform Revenue (Ledger Aggregate)</p>
+            <h2 class="text-3xl font-bold text-green-600">₹<span id="revenue-count">0</span></h2>
+        </div>
+    </div>
+
+    <div class="bg-white rounded-xl shadow-lg overflow-hidden">
+        <div class="p-6 bg-gray-800 text-white flex justify-between items-center">
+            <h3 class="text-xl font-bold">🪪 Driver Fleet</h3>
+            <button onclick="refreshDashboard()" class="bg-blue-500 hover:bg-blue-600 px-4 py-2 rounded">Refresh Data</button>
+        </div>
+        
+        <table class="w-full text-left border-collapse">
+            <thead>
+                <tr class="bg-gray-200 text-gray-700">
+                    <th class="p-4">Phone</th>
+                    <th class="p-4">Role</th>
+                    <th class="p-4">Status</th>
+                    <th class="p-4">Actions</th>
+                </tr>
+            </thead>
+            <tbody id="driver-list"></tbody>
+        </table>
+    </div>
+
+    <script>
+        async function refreshDashboard() {
+            await fetchDrivers();
+            await fetchFinancials();
+        }
+
+        async function fetchDrivers() {
+            const list = document.getElementById('driver-list');
+            list.innerHTML = '<tr><td class="p-4">Loading drivers...</td></tr>';
+
+            try {
+                const response = await fetch('/api/admin/drivers');
+                const data = await response.json();
+                
+                if (!data.success) throw new Error(data.error);
+
+                let html = '';
+                data.drivers.forEach(driver => {
+                    const isBanned = driver.is_banned === true;
+                    html += `
+                        <tr class="border-b hover:bg-gray-50 ${isBanned ? 'opacity-50 grayscale' : ''}">
+                            <td class="p-4 font-mono">${driver.phone}</td>
+                            <td class="p-4"><span class="bg-blue-100 text-blue-800 px-2 py-1 rounded text-xs">DRIVER</span></td>
+                            <td class="p-4">
+                                ${isBanned 
+                                    ? '<span class="bg-red-500 text-white px-2 py-1 rounded font-bold text-xs">BANNED</span>' 
+                                    : '<span class="bg-green-100 text-green-800 px-2 py-1 rounded text-xs">ACTIVE</span>'}
+                            </td>
+                            <td class="p-4">
+                                ${!isBanned 
+                                    ? `<button onclick="banDriver('${driver.id}')" class="text-red-500 hover:text-red-700 font-bold text-sm">SOFT BAN</button>`
+                                    : `<span class="text-gray-400 italic text-sm">Suspended</span>`}
+                            </td>
+                        </tr>
+                    `;
+                });
+                list.innerHTML = html;
+            } catch (err) {
+                list.innerHTML = `<tr><td class="p-4 text-red-500">Error: ${err.message}</td></tr>`;
+            }
+        }
+
+        async function fetchFinancials() {
+            try {
+                const response = await fetch('/api/admin/financials');
+                const data = await response.json();
+                document.getElementById('revenue-count').innerText = data.totalRevenue || 0;
+            } catch (err) {
+                console.error("Fin Error:", err);
+            }
+        }
+
+        async function banDriver(id) {
+            if(!confirm("Are you sure you want to SOFT BAN this driver? They will be blocked from API/Sockets instantly.")) return;
+
+            try {
+                const response = await fetch('/api/admin/ban', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                });
+                const res = await response.json();
+                if(res.success) {
+                    alert("User Status Updated: BANNED");
+                    refreshDashboard();
+                } else {
+                    alert("Error: " + res.error);
+                }
+            } catch (err) {
+                alert("Request Failed: " + err.message);
+            }
+        }
+
+        refreshDashboard();
+    </script>
+</body>
+</html>
