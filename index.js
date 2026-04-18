@@ -25,6 +25,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 // In-memory OTP storage for Phase 2
 const activeOtps = new Map();
 
+// In-memory Driver Location cache for Phase 17
+const driverLocations = new Map();
+
 // ============================================================
 // --- AUTH & SECURITY MIDDLEWARE ---
 // ============================================================
@@ -271,9 +274,29 @@ io.on("connection", async (socket) => {
   });
 
   // C. RIDER REQUESTS RIDE
-  socket.on("request_ride", (data) => {
+  socket.on("request_ride", async (data) => {
     console.log(`🙋‍♂️ Ride Requested by ${data.riderPhone}`);
     console.log(`📍 Coordinates: ${data.pickupLat}, ${data.pickupLng} -> ${data.dropLat}, ${data.dropLng}`);
+
+    // Phase 18: Weather Context Engine (Anti-Surge)
+    try {
+      if (data.pickupLat && data.pickupLng) {
+         const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${data.pickupLat}&longitude=${data.pickupLng}&current_weather=true`;
+         const wRes = await fetch(weatherUrl);
+         const wData = await wRes.json();
+         if (wData && wData.current_weather) {
+            const code = wData.current_weather.weathercode;
+            if (code >= 51) {
+              console.log(`🌧️ Extreme Weather Detected (Code: ${code}) for ${data.riderPhone}`);
+              io.to(`rider_${data.riderPhone}`).emit("weather_alert", {
+                condition: "Rain",
+                message: "Heavy Rain Detected. Fares remain locked by physics, but consider tipping your driver."
+              });
+              data.weather_condition = "Rain";
+            }
+         }
+      }
+    } catch(e) { console.error("Weather Engine Error:", e.message); }
 
     io.to("active_drivers").emit("new_ride_request", {
       riderId: socket.id,
@@ -286,7 +309,8 @@ io.on("connection", async (socket) => {
       dropLng: data.dropLng,
       fare: data.fare,
       distance: data.distance,
-      vehicle_type: data.vehicle_type
+      vehicle_type: data.vehicle_type,
+      weather_condition: data.weather_condition
     });
   });
 
@@ -347,6 +371,11 @@ io.on("connection", async (socket) => {
 
   // E. DRIVER LOCATION RELAY → RIDER
   socket.on("driver_location_update", (data) => {
+    // Cache for Phase 17
+    if (data.driverPhone || data.phone) {
+        driverLocations.set(data.driverPhone || data.phone, { lat: data.lat, lng: data.lng });
+    }
+    
     // Forward driver's GPS to the specific rider's room
     io.to(`rider_${data.riderPhone}`).emit("driver_location_update", {
       lat: data.lat,
@@ -355,16 +384,66 @@ io.on("connection", async (socket) => {
     });
   });
 
+  // Phase 17.0 Dynamic Route Math Engine
+  socket.on("update_route", async (data) => {
+    console.log(`🗺️ Dynamic Route Recalculation for Route ${data.rideId}`);
+    try {
+      const driverLoc = driverLocations.get(data.driverPhone);
+      if (!driverLoc) throw new Error("Driver location unknown.");
+
+      // Calculate new distance -> Driver to Waypoint to Final Destination
+      const url = `http://router.project-osrm.org/route/v1/driving/${driverLoc.lng},${driverLoc.lat};${data.waypoint.lng},${data.waypoint.lat};${data.dropLng},${data.dropLat}?geometries=geojson`;
+      const response = await fetch(url);
+      const osrmData = await response.json();
+
+      if (osrmData && osrmData.routes && osrmData.routes.length > 0) {
+        const route = osrmData.routes[0];
+        const meters = route.distance;
+        const km = meters / 1000;
+        
+        // Fare = distance * tierPrice
+        const newFare = Math.round(km * (parseFloat(data.tierMultiplier) || 9.0));
+
+        // Update database
+        await supabase.from('rides').update({ 
+          fare: newFare, 
+          waypoints: JSON.stringify([{ lat: data.waypoint.lat, lng: data.waypoint.lng, address: data.waypoint.address }])
+        }).eq('id', data.rideId);
+
+        const payload = {
+          newFare: newFare.toString(),
+          distanceStr: `${km.toFixed(1)} km`,
+          polyline: route.geometry.coordinates,
+          waypoint: data.waypoint
+        };
+
+        // Broadcast
+        io.to(`rider_${data.riderPhone}`).emit("route_recalculated", payload);
+        io.to(`driver_${data.driverPhone}`).emit("route_recalculated", payload);
+      }
+    } catch (e) {
+      console.error("Route Update Error:", e);
+    }
+  });
+
   // F. RIDE STATUS UPDATES (with ack callback for COMPLETED)
   socket.on("ride_status_update", async (data, ackCallback) => {
     console.log(`📢 Status Update: ${data.status} for Rider ${data.riderId}`);
 
     let rideId = data.rideId;
 
-    if (["ACCEPTED", "ARRIVED", "IN_PROGRESS", "COMPLETED"].includes(data.status)) {
+    if (["ACCEPTED", "ARRIVED", "IN_PROGRESS", "COMPLETED", "CANCELLED"].includes(data.status)) {
       try {
         if (rideId) {
           await supabase.from('rides').update({ status: data.status }).eq('id', rideId);
+          
+          // Phase 16.0: The Vault Logic
+          if (data.status === 'COMPLETED') {
+            await supabase.from('admin_ledger').insert([{ transaction_type: 'platform_fee', amount: 10, driver_id: data.driverPhone }]);
+          } else if (data.status === 'CANCELLED') {
+            await supabase.from('admin_ledger').insert([{ transaction_type: 'cancellation_fee', amount: 20, driver_id: data.driverPhone }]);
+            await supabase.from('rides').update({ cancelled_by: data.cancelledBy || 'unknown', cancellation_reason: data.cancellationReason || 'User Cancelled' }).eq('id', rideId);
+          }
         }
       } catch (err) {
         console.error("Failed to process ride status DB update:", err);
@@ -453,6 +532,72 @@ io.on("connection", async (socket) => {
       io.to(`rider_${data.phone}`).emit("wallet_updated", { balance: 5000 });
       console.log(`🔧 Dev Mode: Reset wallet for ${data.phone} to 5000`);
     } catch(err) {}
+  });
+
+  // Phase 16.0: Messaging Pipeline
+  socket.on("send_message", (data) => {
+    // Expected: { room_id, sender, text, timestamp }
+    io.to(data.room_id).emit("receive_message", data);
+  });
+
+  // Phase 16.0: QR Handshake
+  socket.on("qr_pair_request", async (data) => {
+    // data: { riderPhone, driverPhone }
+    const roomId = `room_qr_${data.riderPhone}_${data.driverPhone}`;
+    socket.join(roomId);
+    
+    // Force driver into the room
+    const driverSockets = await io.in(`driver_${data.driverPhone}`).fetchSockets();
+    driverSockets.forEach(s => s.join(roomId));
+
+    console.log(`🤝 QR Pair Handshake: ${data.riderPhone} <-> ${data.driverPhone}`);
+
+    try {
+      const { data: newRide, error } = await supabase.from('rides').insert([{
+        rider_phone: data.riderPhone,
+        driver_phone: data.driverPhone,
+        pickup: 'Street Hail / QR Scanned',
+        dropoff: 'TBD',
+        fare: 0,
+        status: 'ACCEPTED'
+      }]).select();
+
+      const rideId = newRide && newRide.length > 0 ? newRide[0].id : null;
+      
+      const payload = {
+         roomId: roomId,
+         rideId: rideId,
+         driverPhone: data.driverPhone,
+         riderPhone: data.riderPhone,
+         status: 'ACCEPTED'
+      };
+
+      io.to(roomId).emit("qr_paired", payload);
+    } catch(err) {
+      console.error("QR Pair Error", err);
+    }
+  });
+
+  // Phase 16.0: Driver Reporting
+  socket.on("report_driver", async (data) => {
+    try {
+      await supabase.from('driver_reports').insert([{
+        driver_id: data.driverPhone,
+        rider_id: data.riderPhone,
+        reason: data.reason || 'General'
+      }]);
+
+      const { count } = await supabase.from('driver_reports').select('*', { count: 'exact' }).eq('driver_id', data.driverPhone);
+      
+      if (count >= 3) {
+        await supabase.from('users').update({ is_suspended: true, is_banned: true }).eq('phone', data.driverPhone);
+        await supabase.from('admin_ledger').insert([{ transaction_type: 'fine', amount: 1500, driver_id: data.driverPhone }]);
+        io.to(`driver_${data.driverPhone}`).emit("account_suspended", { message: "Account suspended due to multiple reports." });
+        console.log(`⚖️ Vault Strike: Driver ${data.driverPhone} suspended & fined 1500.`);
+      }
+    } catch (e) {
+      console.error("Report Driver Error", e);
+    }
   });
 
   socket.on("disconnect", () => {
